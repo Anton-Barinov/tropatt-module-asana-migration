@@ -287,7 +287,9 @@ final class AsanaClient
 
     private function allowedHost(string $host): bool
     {
-        return $host === 'app.asana.com' || str_ends_with($host, '.asana.com');
+        // The PAT is valid only for Asana's API origin. Do not forward it to
+        // arbitrary Asana subdomains returned in attachment URLs/redirects.
+        return strtolower($host) === 'app.asana.com';
     }
 
     private function allowedAttachmentHost(string $host): bool

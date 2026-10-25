@@ -156,7 +156,7 @@ final class AsanaMigrationController
         return JsonResponse::success('ASANA_USER_MAPPING_UPDATED', 'Mapping updated');
     }
 
-    public function listJobs(): JsonResponse { return JsonResponse::success('ASANA_JOBS_LIST', 'OK', ['items' => $this->repo->listJobs($this->actorId(), $this->can('module.asana-migration.manage'))]); }
+    public function listJobs(): JsonResponse { return JsonResponse::success('ASANA_JOBS_LIST', 'OK', ['items' => array_map([$this, 'publicJob'], $this->repo->listJobs($this->actorId(), $this->can('module.asana-migration.manage')))]); }
 
     public function createJob(): JsonResponse
     {
@@ -181,10 +181,10 @@ final class AsanaMigrationController
         $mode = (string)($input['mode'] ?? 'import'); if (!in_array($mode, ['import', 'sync', 'dry_run'], true)) return JsonResponse::error('VALIDATION_ERROR', 'mode must be import, sync or dry_run', 422);
         $scope = (array)($input['source_scope'] ?? []); $scope['project_gids'] = array_values(array_filter(array_map('strval', (array)($input['project_gids'] ?? $scope['project_gids'] ?? [])))); $scope['max_tasks'] = max(0, (int)($input['max_tasks'] ?? $scope['max_tasks'] ?? 0));
         $job = $this->repo->createJob(['connection_id' => (int)$connection['id'], 'workspace_gid' => $workspace, 'mode' => $mode, 'source_scope' => $scope, 'target_options' => (array)($input['target_options'] ?? $input['options'] ?? []), 'created_by_user_id' => $this->actorId()]);
-        return JsonResponse::success('ASANA_JOB_CREATED', 'Job created', ['job' => $job], 201);
+        return JsonResponse::success('ASANA_JOB_CREATED', 'Job created', ['job' => $this->publicJob($job)], 201);
     }
 
-    public function getJob(array $params): JsonResponse { $result = $this->job((string)($params['public_id'] ?? '')); return $result instanceof JsonResponse ? $result : JsonResponse::success('ASANA_JOB', 'OK', ['job' => $result]); }
+    public function getJob(array $params): JsonResponse { $result = $this->job((string)($params['public_id'] ?? '')); return $result instanceof JsonResponse ? $result : JsonResponse::success('ASANA_JOB', 'OK', ['job' => $this->publicJob($result)]); }
     public function startJob(array $params): JsonResponse { return $this->changeJob((string)$params['public_id'], 'queued', 'ASANA_JOB_QUEUED'); }
     public function pauseJob(array $params): JsonResponse { return $this->changeJob((string)$params['public_id'], 'pausing', 'ASANA_JOB_PAUSING'); }
     public function resumeJob(array $params): JsonResponse { return $this->changeJob((string)$params['public_id'], 'queued', 'ASANA_JOB_RESUMED'); }
@@ -213,6 +213,13 @@ final class AsanaMigrationController
     }
 
     private function client(array $connection): AsanaClient { $client = new AsanaClient($this->repo); $client->setConnectionId((int)$connection['id']); return $client; }
+
+    /** Remove worker-only lease credentials before a migration job leaves the API boundary. */
+    public function publicJob(array $job): array
+    {
+        unset($job['lease_token']);
+        return $job;
+    }
 
     private function buildImportService(): AsanaImportService
     {

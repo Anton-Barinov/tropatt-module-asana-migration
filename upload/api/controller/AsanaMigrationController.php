@@ -201,7 +201,7 @@ final class AsanaMigrationController
 
     public function listJobItems(array $params): JsonResponse { $result = $this->job((string)$params['public_id']); if ($result instanceof JsonResponse) return $result; $input = $this->container->get('request')->allInput(); return JsonResponse::success('ASANA_JOB_ITEMS', 'OK', ['items' => $this->repo->items((int)$result['id'], !empty($input['status']) ? (string)$input['status'] : null, max(1, min(1000, (int)($input['limit'] ?? 200))))]); }
     public function listJobLogs(array $params): JsonResponse { $result = $this->job((string)$params['public_id']); return $result instanceof JsonResponse ? $result : JsonResponse::success('ASANA_JOB_LOGS', 'OK', ['items' => $this->repo->logs((int)$result['id'])]); }
-    public function getReport(array $params): JsonResponse { $result = $this->job((string)$params['public_id']); return $result instanceof JsonResponse ? $result : JsonResponse::success('ASANA_JOB_REPORT', 'OK', ['report' => $this->repo->report((string)$params['public_id'])]); }
+    public function getReport(array $params): JsonResponse { $result = $this->job((string)$params['public_id']); return $result instanceof JsonResponse ? $result : JsonResponse::success('ASANA_JOB_REPORT', 'OK', ['report' => $this->publicJob($this->repo->report((string)$params['public_id']))]); }
 
     private function changeJob(string $id, string $status, string $code): JsonResponse
     {

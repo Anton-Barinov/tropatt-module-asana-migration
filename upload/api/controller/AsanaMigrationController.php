@@ -42,9 +42,37 @@ final class AsanaMigrationController
         return !empty($actor['is_root']) || in_array('*', (array)($actor['permission_codes'] ?? []), true) || in_array($permission, (array)($actor['permission_codes'] ?? []), true);
     }
 
+    private function workspaceAccess(): array|JsonResponse
+    {
+        $actor = $this->actor();
+        if ((int)($actor['id'] ?? 0) < 1) return JsonResponse::error('UNAUTHORIZED', 'Authentication is required', 401);
+        if (!$this->container->has('service.organization_context') || !$this->container->has('request')) {
+            return JsonResponse::error('WORKSPACE_REQUIRED', 'Select a CRM workspace before using the Asana migration module', 409);
+        }
+        try {
+            $resolved = $this->container->get('service.organization_context')->resolve($this->container->get('request'), $actor);
+        } catch (\Throwable) {
+            return JsonResponse::error('WORKSPACE_REQUIRED', 'Select a CRM workspace before using the Asana migration module', 409);
+        }
+        if (($resolved['status'] ?? '') === 'forbidden') {
+            return JsonResponse::error('ORGANIZATION_CONTEXT_NOT_FOUND', 'The selected workspace is unavailable', 404);
+        }
+        $organization = $resolved['organization'] ?? null;
+        $organizationId = is_array($organization) ? (int)($organization['id'] ?? 0) : 0;
+        $isRoot = !empty($actor['is_root']);
+        if (($resolved['status'] ?? '') !== 'active' || $organizationId < 1 || ($isRoot && empty($resolved['is_explicit']))) {
+            return JsonResponse::error('WORKSPACE_REQUIRED', 'Select a CRM workspace before using the Asana migration module', 409);
+        }
+        $actor['organization_id'] = $organizationId;
+        $actor['organization_public_id'] = (string)($organization['public_id'] ?? '');
+        return ['actor' => $actor, 'organization_id' => $organizationId];
+    }
+
     private function connection(string $id): array|JsonResponse
     {
-        $connection = $this->repo->getConnection($id);
+        $workspace = $this->workspaceAccess();
+        if ($workspace instanceof JsonResponse) return $workspace;
+        $connection = $this->repo->getConnection($id, (int)$workspace['organization_id']);
         if (!$connection) return JsonResponse::error('NOT_FOUND', 'Asana connection not found', 404);
         if (!$this->can('module.asana-migration.manage') && (int)$connection['created_by_user_id'] !== $this->actorId()) return JsonResponse::error('FORBIDDEN', 'Connection access denied', 403);
         return $connection;
@@ -52,7 +80,9 @@ final class AsanaMigrationController
 
     private function job(string $id): array|JsonResponse
     {
-        $job = $this->repo->getJob($id);
+        $workspace = $this->workspaceAccess();
+        if ($workspace instanceof JsonResponse) return $workspace;
+        $job = $this->repo->getJob($id, (int)$workspace['organization_id']);
         if (!$job) return JsonResponse::error('NOT_FOUND', 'Asana migration job not found', 404);
         if (!$this->can('module.asana-migration.manage') && (int)$job['created_by_user_id'] !== $this->actorId()) return JsonResponse::error('FORBIDDEN', 'Migration job access denied', 403);
         return $job;
@@ -60,7 +90,9 @@ final class AsanaMigrationController
 
     public function listConnections(): JsonResponse
     {
-        $items = $this->repo->listConnections($this->actorId(), $this->can('module.asana-migration.manage'));
+        $workspace = $this->workspaceAccess();
+        if ($workspace instanceof JsonResponse) return $workspace;
+        $items = $this->repo->listConnections($this->actorId(), $this->can('module.asana-migration.manage'), (int)$workspace['organization_id']);
         return JsonResponse::success('ASANA_CONNECTIONS_LIST', 'OK', ['connections' => array_map([$this, 'publicConnection'], $items)]);
     }
 
@@ -71,18 +103,23 @@ final class AsanaMigrationController
 
     private function createConnectionInternal(): JsonResponse
     {
+        $workspace = $this->workspaceAccess();
+        if ($workspace instanceof JsonResponse) return $workspace;
+        $organizationId = (int)$workspace['organization_id'];
+        $actor = (array)$workspace['actor'];
         $input = $this->body();
         $name = trim((string)($input['name'] ?? ''));
         $token = trim((string)($input['access_token'] ?? $input['token'] ?? ''));
         if ($name === '' || $token === '') return JsonResponse::error('VALIDATION_ERROR', 'name and access_token are required', 422);
         $connection = null;
         try {
-            $connection = $this->repo->createConnection(['name' => mb_substr($name, 0, 255), 'auth_type' => 'pat', 'access_token_encrypted' => EncryptionService::encrypt($token), 'created_by_user_id' => $this->actorId()]);
+            $connection = $this->repo->createConnection(['organization_id' => $organizationId, 'name' => mb_substr($name, 0, 255), 'auth_type' => 'pat', 'access_token_encrypted' => EncryptionService::encrypt($token), 'created_by_user_id' => (int)$actor['id']]);
             $me = $this->client($connection)->me($token);
-            $this->repo->updateConnectionCheck((string)$connection['public_id'], true);
-            return JsonResponse::success('ASANA_CONNECTION_CREATED', 'Connection created and verified', ['connection' => $this->publicConnection($this->repo->getConnection((string)$connection['public_id']) ?? $connection), 'user' => $me], 201);
+            $this->repo->updateConnectionCheck((string)$connection['public_id'], $organizationId, true);
+            return JsonResponse::success('ASANA_CONNECTION_CREATED', 'Connection created and verified', ['connection' => $this->publicConnection($this->repo->getConnection((string)$connection['public_id'], $organizationId) ?? $connection), 'user' => $me], 201);
         } catch (\Throwable $e) {
-            if (is_array($connection) && !empty($connection['public_id'])) $this->repo->updateConnectionCheck((string)$connection['public_id'], false, 'Asana connection test failed');
+            if ($e->getMessage() === 'ASANA_WORKSPACE_MEMBERSHIP_REQUIRED') return JsonResponse::error('WORKSPACE_ACCESS_REVOKED', 'Your access to the selected workspace has changed', 403);
+            if (is_array($connection) && !empty($connection['public_id'])) $this->repo->updateConnectionCheck((string)$connection['public_id'], $organizationId, false, 'Asana connection test failed');
             return JsonResponse::error($e->getMessage() === 'ASANA_AUTH_FAILED' ? 'ASANA_AUTH_FAILED' : 'ASANA_CONNECTION_TEST_FAILED', 'Asana credentials could not be verified', 422);
         }
     }
@@ -102,8 +139,10 @@ final class AsanaMigrationController
         $newToken = (string)($input['access_token'] ?? $input['token'] ?? '');
         if ($newToken !== '') $update['access_token_encrypted'] = EncryptionService::encrypt($newToken);
         if (array_key_exists('workspace_gid', $input)) $update['workspace_gid'] = trim((string)$input['workspace_gid']) ?: null;
-        $this->repo->updateConnection((string)$params['public_id'], $update);
-        return JsonResponse::success('ASANA_CONNECTION_UPDATED', 'Connection updated', ['connection' => $this->publicConnection($this->repo->getConnection((string)$params['public_id']) ?? [])]);
+        $workspace = $this->workspaceAccess(); if ($workspace instanceof JsonResponse) return $workspace;
+        $organizationId = (int)$workspace['organization_id'];
+        $this->repo->updateConnection((string)$params['public_id'], $organizationId, $update);
+        return JsonResponse::success('ASANA_CONNECTION_UPDATED', 'Connection updated', ['connection' => $this->publicConnection($this->repo->getConnection((string)$params['public_id'], $organizationId) ?? [])]);
     }
 
     public function deleteConnection(array $params): JsonResponse
@@ -111,7 +150,13 @@ final class AsanaMigrationController
         $result = $this->connection((string)($params['public_id'] ?? ''));
         if ($result instanceof JsonResponse) return $result;
         if ($this->repo->hasRunningJobs((int)$result['id'])) return JsonResponse::error('CONNECTION_HAS_RUNNING_JOBS', 'Cancel running jobs before deleting the connection', 409);
-        $this->repo->deleteConnection((int)$result['id']);
+        $workspace = $this->workspaceAccess(); if ($workspace instanceof JsonResponse) return $workspace;
+        try {
+            $this->repo->deleteConnection((int)$result['id'], (int)$workspace['organization_id']);
+        } catch (\RuntimeException $e) {
+            if ($e->getMessage() === 'CONNECTION_HAS_RUNNING_JOBS') return JsonResponse::error('CONNECTION_HAS_RUNNING_JOBS', 'Cancel running jobs before deleting the connection', 409);
+            throw $e;
+        }
         return JsonResponse::success('ASANA_CONNECTION_DELETED', 'Connection deleted');
     }
 
@@ -119,10 +164,19 @@ final class AsanaMigrationController
     {
         $result = $this->connection((string)($params['public_id'] ?? ''));
         if ($result instanceof JsonResponse) return $result;
+        $workspace = $this->workspaceAccess();
+        if ($workspace instanceof JsonResponse) return $workspace;
+        $organizationId = (int)$workspace['organization_id'];
         $token = EncryptionService::decrypt((string)$result['access_token_encrypted']);
         if ($token === null) return JsonResponse::error('ASANA_CREDENTIAL_DECRYPT_FAILED', 'Could not decrypt credentials', 500);
-        try { $me = $this->client($result)->me($token); $this->repo->updateConnectionCheck((string)$result['public_id'], true); return JsonResponse::success('ASANA_CONNECTION_TEST_OK', 'Connection successful', ['user' => $me]); }
-        catch (\Throwable) { $this->repo->updateConnectionCheck((string)$result['public_id'], false, 'Asana connection test failed'); return JsonResponse::error('ASANA_CONNECTION_TEST_FAILED', 'Asana connection test failed', 400); }
+        try {
+            $me = $this->client($result)->me($token);
+            $this->repo->updateConnectionCheck((string)$result['public_id'], $organizationId, true);
+            return JsonResponse::success('ASANA_CONNECTION_TEST_OK', 'Connection successful', ['user' => $me]);
+        } catch (\Throwable) {
+            $this->repo->updateConnectionCheck((string)$result['public_id'], $organizationId, false, 'Asana connection test failed');
+            return JsonResponse::error('ASANA_CONNECTION_TEST_FAILED', 'Asana connection test failed', 400);
+        }
     }
 
     public function listWorkspaces(array $params): JsonResponse
@@ -151,12 +205,13 @@ final class AsanaMigrationController
     {
         $result = $this->connection((string)($params['public_id'] ?? '')); if ($result instanceof JsonResponse) return $result;
         $input = $this->body(); $crmId = !empty($input['crm_user_public_id']) ? (string)$input['crm_user_public_id'] : null;
-        if ($crmId !== null && $this->repo->activeUserPublicId($crmId) === null) return JsonResponse::error('USER_NOT_FOUND', 'Active CRM user not found', 404);
+        $workspace = $this->workspaceAccess(); if ($workspace instanceof JsonResponse) return $workspace;
+        if ($crmId !== null && $this->repo->activeUserPublicId($crmId, (int)$workspace['organization_id']) === null) return JsonResponse::error('USER_NOT_FOUND', 'Active CRM user not found', 404);
         if (!$this->repo->updateUserMapping((int)$result['id'], (int)($params['mapping_id'] ?? 0), $crmId)) return JsonResponse::error('MAPPING_NOT_FOUND', 'Asana user mapping not found', 404);
         return JsonResponse::success('ASANA_USER_MAPPING_UPDATED', 'Mapping updated');
     }
 
-    public function listJobs(): JsonResponse { return JsonResponse::success('ASANA_JOBS_LIST', 'OK', ['items' => $this->repo->listJobs($this->actorId(), $this->can('module.asana-migration.manage'))]); }
+    public function listJobs(): JsonResponse { $workspace = $this->workspaceAccess(); if ($workspace instanceof JsonResponse) return $workspace; $items = $this->repo->listJobs($this->actorId(), $this->can('module.asana-migration.manage'), (int)$workspace['organization_id']); return JsonResponse::success('ASANA_JOBS_LIST', 'OK', ['items' => array_map([$this, 'publicJob'], $items)]); }
 
     public function createJob(): JsonResponse
     {
@@ -165,6 +220,9 @@ final class AsanaMigrationController
 
     private function createJobInternal(): JsonResponse
     {
+        $workspaceContext = $this->workspaceAccess();
+        if ($workspaceContext instanceof JsonResponse) return $workspaceContext;
+        $organizationId = (int)$workspaceContext['organization_id'];
         $input = $this->body(); $connection = $this->connection((string)($input['connection_public_id'] ?? '')); if ($connection instanceof JsonResponse) return $connection;
         $workspace = trim((string)($input['workspace_gid'] ?? $connection['workspace_gid'] ?? '')); if ($workspace === '') return JsonResponse::error('ASANA_WORKSPACE_REQUIRED', 'workspace_gid is required', 422);
         $token = EncryptionService::decrypt((string)($connection['access_token_encrypted'] ?? ''));
@@ -180,35 +238,44 @@ final class AsanaMigrationController
         }
         $mode = (string)($input['mode'] ?? 'import'); if (!in_array($mode, ['import', 'sync', 'dry_run'], true)) return JsonResponse::error('VALIDATION_ERROR', 'mode must be import, sync or dry_run', 422);
         $scope = (array)($input['source_scope'] ?? []); $scope['project_gids'] = array_values(array_filter(array_map('strval', (array)($input['project_gids'] ?? $scope['project_gids'] ?? [])))); $scope['max_tasks'] = max(0, (int)($input['max_tasks'] ?? $scope['max_tasks'] ?? 0));
-        $job = $this->repo->createJob(['connection_id' => (int)$connection['id'], 'workspace_gid' => $workspace, 'mode' => $mode, 'source_scope' => $scope, 'target_options' => (array)($input['target_options'] ?? $input['options'] ?? []), 'created_by_user_id' => $this->actorId()]);
-        return JsonResponse::success('ASANA_JOB_CREATED', 'Job created', ['job' => $job], 201);
+        $targetOptions = (array)($input['target_options'] ?? $input['options'] ?? []);
+        $targetOptions['max_attachment_size_mb'] = min(AsanaImportService::MAX_ATTACHMENT_SIZE_MB, max(1, (int)($targetOptions['max_attachment_size_mb'] ?? AsanaImportService::MAX_ATTACHMENT_SIZE_MB)));
+        try {
+            $job = $this->repo->createJob(['organization_id' => $organizationId, 'connection_id' => (int)$connection['id'], 'workspace_gid' => $workspace, 'mode' => $mode, 'source_scope' => $scope, 'target_options' => $targetOptions, 'created_by_user_id' => $this->actorId()]);
+        } catch (\RuntimeException $e) {
+            if ($e->getMessage() === 'ASANA_CONNECTION_NOT_FOUND') return JsonResponse::error('NOT_FOUND', 'Asana connection not found in this workspace', 404);
+            if (in_array($e->getMessage(), ['ASANA_WORKSPACE_REQUIRED', 'ASANA_WORKSPACE_MEMBERSHIP_REQUIRED'], true)) return JsonResponse::error('WORKSPACE_ACCESS_REVOKED', 'Your access to the selected workspace has changed', 403);
+            throw $e;
+        }
+        return JsonResponse::success('ASANA_JOB_CREATED', 'Job created', ['job' => $this->publicJob($job)], 201);
     }
 
-    public function getJob(array $params): JsonResponse { $result = $this->job((string)($params['public_id'] ?? '')); return $result instanceof JsonResponse ? $result : JsonResponse::success('ASANA_JOB', 'OK', ['job' => $result]); }
+    public function getJob(array $params): JsonResponse { $result = $this->job((string)($params['public_id'] ?? '')); return $result instanceof JsonResponse ? $result : JsonResponse::success('ASANA_JOB', 'OK', ['job' => $this->publicJob($result)]); }
     public function startJob(array $params): JsonResponse { return $this->changeJob((string)$params['public_id'], 'queued', 'ASANA_JOB_QUEUED'); }
     public function pauseJob(array $params): JsonResponse { return $this->changeJob((string)$params['public_id'], 'pausing', 'ASANA_JOB_PAUSING'); }
     public function resumeJob(array $params): JsonResponse { return $this->changeJob((string)$params['public_id'], 'queued', 'ASANA_JOB_RESUMED'); }
     public function cancelJob(array $params): JsonResponse { return $this->changeJob((string)$params['public_id'], 'cancelling', 'ASANA_JOB_CANCELLING'); }
 
-    public function retryFailed(array $params): JsonResponse { $result = $this->job((string)$params['public_id']); if ($result instanceof JsonResponse) return $result; if (!in_array((string)($result['status'] ?? ''), ['completed_with_warnings', 'failed', 'cancelled'], true)) return JsonResponse::error('INVALID_JOB_STATUS', 'Only a finished job can be retried', 409); $count = $this->repo->retryJob((string)$params['public_id']); if ($count === null) return JsonResponse::error('INVALID_JOB_STATUS', 'Job changed concurrently; retry it again', 409); return JsonResponse::success('ASANA_JOB_RETRY_QUEUED', 'Failed items queued for retry', ['reset_items' => $count]); }
+    public function retryFailed(array $params): JsonResponse { $result = $this->job((string)$params['public_id']); if ($result instanceof JsonResponse) return $result; if (!in_array((string)($result['status'] ?? ''), ['completed_with_warnings', 'failed', 'cancelled'], true)) return JsonResponse::error('INVALID_JOB_STATUS', 'Only a finished job can be retried', 409); $workspace = $this->workspaceAccess(); if ($workspace instanceof JsonResponse) return $workspace; $count = $this->repo->retryJob((string)$params['public_id'], (int)$workspace['organization_id']); if ($count === null) return JsonResponse::error('INVALID_JOB_STATUS', 'Job changed concurrently; retry it again', 409); return JsonResponse::success('ASANA_JOB_RETRY_QUEUED', 'Failed items queued for retry', ['reset_items' => $count]); }
 
     public function rollbackJob(array $params): JsonResponse
     {
         $result = $this->job((string)$params['public_id']); if ($result instanceof JsonResponse) return $result;
-        try { $this->buildImportService()->rollback((string)$params['public_id'], $this->actor()); return JsonResponse::success('ASANA_JOB_ROLLED_BACK', 'Job targets rolled back'); }
+        try { $workspace = $this->workspaceAccess(); if ($workspace instanceof JsonResponse) return $workspace; $this->buildImportService()->rollback((string)$params['public_id'], (array)$workspace['actor']); return JsonResponse::success('ASANA_JOB_ROLLED_BACK', 'Job targets rolled back'); }
         catch (\Throwable) { return JsonResponse::error('ASANA_ROLLBACK_FAILED', 'Rollback failed; inspect the migration log', 409); }
     }
 
     public function listJobItems(array $params): JsonResponse { $result = $this->job((string)$params['public_id']); if ($result instanceof JsonResponse) return $result; $input = $this->container->get('request')->allInput(); return JsonResponse::success('ASANA_JOB_ITEMS', 'OK', ['items' => $this->repo->items((int)$result['id'], !empty($input['status']) ? (string)$input['status'] : null, max(1, min(1000, (int)($input['limit'] ?? 200))))]); }
     public function listJobLogs(array $params): JsonResponse { $result = $this->job((string)$params['public_id']); return $result instanceof JsonResponse ? $result : JsonResponse::success('ASANA_JOB_LOGS', 'OK', ['items' => $this->repo->logs((int)$result['id'])]); }
-    public function getReport(array $params): JsonResponse { $result = $this->job((string)$params['public_id']); return $result instanceof JsonResponse ? $result : JsonResponse::success('ASANA_JOB_REPORT', 'OK', ['report' => $this->repo->report((string)$params['public_id'])]); }
+    public function getReport(array $params): JsonResponse { $result = $this->job((string)$params['public_id']); if ($result instanceof JsonResponse) return $result; $workspace = $this->workspaceAccess(); if ($workspace instanceof JsonResponse) return $workspace; $report = $this->repo->report((string)$params['public_id'], (int)$workspace['organization_id']); return JsonResponse::success('ASANA_JOB_REPORT', 'OK', ['report' => $this->publicJob($report)]); }
 
     private function changeJob(string $id, string $status, string $code): JsonResponse
     {
         $result = $this->job($id); if ($result instanceof JsonResponse) return $result; $current = (string)($result['status'] ?? '');
         $allowed = match ($status) { 'queued' => in_array($current, ['draft', 'paused', 'failed', 'cancelled'], true), 'pausing' => in_array($current, ['queued', 'running'], true), 'cancelling' => in_array($current, ['draft', 'queued', 'running', 'paused', 'pausing'], true), default => false };
         if (!$allowed) return JsonResponse::error('INVALID_JOB_STATUS', 'Job cannot be changed from status: ' . $current, 409);
-        if (!$this->repo->requestStatus($id, $status)) return JsonResponse::error('INVALID_JOB_STATUS', 'Job changed concurrently; retry the action', 409);
+        $workspace = $this->workspaceAccess(); if ($workspace instanceof JsonResponse) return $workspace;
+        if (!$this->repo->requestStatus($id, $current, $status, (int)$workspace['organization_id'])) return JsonResponse::error('INVALID_JOB_STATUS', 'Job changed concurrently; retry the action', 409);
         return JsonResponse::success($code, 'Job state updated');
     }
 
@@ -235,4 +302,5 @@ final class AsanaMigrationController
     }
 
     private function publicConnection(array $connection): array { unset($connection['access_token_encrypted'], $connection['refresh_token_encrypted'], $connection['client_id_encrypted'], $connection['client_secret_encrypted']); return $connection; }
+    private function publicJob(array $job): array { unset($job['lease_token']); return $job; }
 }

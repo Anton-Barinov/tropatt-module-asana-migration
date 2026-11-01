@@ -15,69 +15,107 @@ final class AsanaMigrationRepository
     private function now(): string { return gmdate('Y-m-d H:i:s'); }
     private function json(mixed $value): string { return (string)json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES); }
 
-    public function actor(int $id): array
+    public function actor(int $id, int $organizationId): ?array
     {
-        $stmt = $this->pdo->prepare('SELECT id, public_id, login, full_name, is_root, is_active FROM users WHERE id=:id LIMIT 1');
-        $stmt->execute(['id' => $id]);
-        return ($row = $stmt->fetch(PDO::FETCH_ASSOC)) ?: ['id' => $id, 'is_root' => 0];
+        if ($id < 1 || $organizationId < 1) return null;
+        $stmt = $this->pdo->prepare(
+            'SELECT u.id, u.public_id, u.login, u.full_name, u.is_root, u.is_active
+             FROM users u
+             WHERE u.id = :id AND u.is_active = 1
+               AND (u.is_root = 1 OR EXISTS (
+                    SELECT 1 FROM organization_memberships om
+                    WHERE om.user_id = u.id AND om.organization_id = :organization_id
+               ))
+             LIMIT 1'
+        );
+        $stmt->execute(['id' => $id, 'organization_id' => $organizationId]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($row)) return null;
+        $row['organization_id'] = $organizationId;
+        return $row;
     }
 
-    public function listConnections(int $actorId, bool $manager): array
+    public function listConnections(int $actorId, bool $manager, int $organizationId): array
     {
-        $sql = 'SELECT id,public_id,name,auth_type,workspace_gid,status,last_checked_at,last_error,created_by_user_id,created_at,updated_at FROM module_asana_connections';
-        $params = [];
-        if (!$manager) { $sql .= ' WHERE created_by_user_id=:owner'; $params['owner'] = $actorId; }
+        if ($organizationId < 1) return [];
+        $sql = 'SELECT id,public_id,name,auth_type,workspace_gid,status,last_checked_at,last_error,created_by_user_id,created_at,updated_at FROM module_asana_connections WHERE organization_id=:organization';
+        $params = ['organization' => $organizationId];
+        if (!$manager) { $sql .= ' AND created_by_user_id=:owner'; $params['owner'] = $actorId; }
         $sql .= ' ORDER BY created_at DESC';
         $stmt = $this->pdo->prepare($sql); $stmt->execute($params);
         return $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
     }
 
-    public function getConnection(string $publicId): ?array
+    public function getConnection(string $publicId, int $organizationId): ?array
     {
-        $stmt = $this->pdo->prepare('SELECT * FROM module_asana_connections WHERE public_id=:id LIMIT 1');
-        $stmt->execute(['id' => $publicId]);
+        if ($organizationId < 1) return null;
+        $stmt = $this->pdo->prepare('SELECT * FROM module_asana_connections WHERE public_id=:id AND organization_id=:organization LIMIT 1');
+        $stmt->execute(['id' => $publicId, 'organization' => $organizationId]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC); return is_array($row) ? $row : null;
     }
 
-    public function getConnectionById(int $id): ?array
+    public function getConnectionById(int $id, int $organizationId): ?array
     {
-        $stmt = $this->pdo->prepare('SELECT * FROM module_asana_connections WHERE id=:id LIMIT 1');
-        $stmt->execute(['id' => $id]);
+        if ($id < 1 || $organizationId < 1) return null;
+        $stmt = $this->pdo->prepare('SELECT * FROM module_asana_connections WHERE id=:id AND organization_id=:organization LIMIT 1');
+        $stmt->execute(['id' => $id, 'organization' => $organizationId]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC); return is_array($row) ? $row : null;
     }
 
     public function createConnection(array $data): array
     {
+        $organizationId = (int)($data['organization_id'] ?? 0);
+        $ownerId = (int)($data['created_by_user_id'] ?? 0);
+        if ($organizationId < 1 || $ownerId < 1) throw new \RuntimeException('ASANA_WORKSPACE_REQUIRED');
         $publicId = $this->id('asc'); $now = $this->now();
-        $stmt = $this->pdo->prepare('INSERT INTO module_asana_connections (public_id,name,auth_type,access_token_encrypted,refresh_token_encrypted,client_id_encrypted,client_secret_encrypted,status,created_by_user_id,created_at,updated_at) VALUES (:public_id,:name,:auth,:access,:refresh,:client,:secret,\'draft\',:owner,:created,:updated)');
-        $stmt->execute(['public_id' => $publicId, 'name' => $data['name'], 'auth' => $data['auth_type'] ?? 'pat', 'access' => $data['access_token_encrypted'] ?? null, 'refresh' => $data['refresh_token_encrypted'] ?? null, 'client' => $data['client_id_encrypted'] ?? null, 'secret' => $data['client_secret_encrypted'] ?? null, 'owner' => $data['created_by_user_id'], 'created' => $now, 'updated' => $now]);
-        return $this->getConnection($publicId) ?? ['public_id' => $publicId];
+        $stmt = $this->pdo->prepare("INSERT INTO module_asana_connections (public_id,organization_id,name,auth_type,access_token_encrypted,refresh_token_encrypted,client_id_encrypted,client_secret_encrypted,status,created_by_user_id,created_at,updated_at) SELECT :public_id,:organization,:name,:auth,:access,:refresh,:client,:secret,'draft',u.id,:created,:updated FROM users u WHERE u.id=:owner AND u.is_active=1 AND (u.is_root=1 OR EXISTS (SELECT 1 FROM organization_memberships om WHERE om.user_id=u.id AND om.organization_id=:organization_check))");
+        $stmt->execute(['public_id' => $publicId, 'organization' => $organizationId, 'name' => $data['name'], 'auth' => $data['auth_type'] ?? 'pat', 'access' => $data['access_token_encrypted'] ?? null, 'refresh' => $data['refresh_token_encrypted'] ?? null, 'client' => $data['client_id_encrypted'] ?? null, 'secret' => $data['client_secret_encrypted'] ?? null, 'owner' => $ownerId, 'created' => $now, 'updated' => $now, 'organization_check' => $organizationId]);
+        if ($stmt->rowCount() !== 1) throw new \RuntimeException('ASANA_WORKSPACE_MEMBERSHIP_REQUIRED');
+        return $this->getConnection($publicId, $organizationId) ?? ['public_id' => $publicId, 'organization_id' => $organizationId];
     }
 
-    public function updateConnection(string $publicId, array $data): void
+    public function updateConnection(string $publicId, int $organizationId, array $data): void
     {
+        if ($organizationId < 1) throw new \RuntimeException('ASANA_WORKSPACE_REQUIRED');
         $allowed = ['name','access_token_encrypted','refresh_token_encrypted','client_id_encrypted','client_secret_encrypted','workspace_gid'];
-        $sets = []; $params = ['id' => $publicId, 'updated' => $this->now()];
+        $sets = []; $params = ['id' => $publicId, 'organization' => $organizationId, 'updated' => $this->now()];
         foreach ($allowed as $field) if (array_key_exists($field, $data)) { $sets[] = $field . '=:' . $field; $params[$field] = $data[$field]; }
         if ($sets === []) return;
         $sets[] = 'updated_at=:updated';
-        $this->pdo->prepare('UPDATE module_asana_connections SET ' . implode(',', $sets) . ' WHERE public_id=:id')->execute($params);
+        $stmt = $this->pdo->prepare('UPDATE module_asana_connections SET ' . implode(',', $sets) . ' WHERE public_id=:id AND organization_id=:organization');
+        $stmt->execute($params);
+        if ($stmt->rowCount() !== 1) throw new \RuntimeException('ASANA_CONNECTION_NOT_FOUND');
     }
 
-    public function updateConnectionCheck(string $publicId, bool $ok, string $error = '', ?string $workspaceGid = null): void
+    public function updateConnectionCheck(string $publicId, int $organizationId, bool $ok, string $error = '', ?string $workspaceGid = null): bool
     {
+        if ($organizationId < 1) return false;
         $sets = ['status=:status','last_checked_at=:checked','last_error=:error','updated_at=:updated'];
-        $params = ['status' => $ok ? 'active' : 'failed', 'checked' => $this->now(), 'error' => $error !== '' ? mb_substr($error, 0, 1000) : null, 'updated' => $this->now(), 'id' => $publicId];
+        $params = ['status' => $ok ? 'active' : 'failed', 'checked' => $this->now(), 'error' => $error !== '' ? mb_substr($error, 0, 1000) : null, 'updated' => $this->now(), 'id' => $publicId, 'organization' => $organizationId];
         if ($workspaceGid !== null) { $sets[] = 'workspace_gid=:workspace'; $params['workspace'] = $workspaceGid; }
-        $this->pdo->prepare('UPDATE module_asana_connections SET ' . implode(',', $sets) . ' WHERE public_id=:id')->execute($params);
+        $stmt = $this->pdo->prepare('UPDATE module_asana_connections SET ' . implode(',', $sets) . ' WHERE public_id=:id AND organization_id=:organization');
+        $stmt->execute($params);
+        return $stmt->rowCount() === 1;
     }
 
-    public function deleteConnection(int $connectionId): void
+    public function deleteConnection(int $connectionId, int $organizationId): void
     {
+        if ($connectionId < 1 || $organizationId < 1) throw new \RuntimeException('ASANA_CONNECTION_NOT_FOUND');
         $this->pdo->beginTransaction();
         try {
-            foreach (['module_asana_unresolved_entities' => 'job_id IN (SELECT id FROM module_asana_jobs WHERE connection_id=:id)', 'module_asana_job_logs' => 'job_id IN (SELECT id FROM module_asana_jobs WHERE connection_id=:id)', 'module_asana_job_items' => 'job_id IN (SELECT id FROM module_asana_jobs WHERE connection_id=:id)', 'module_asana_jobs' => 'connection_id=:id', 'module_asana_source_mappings' => 'connection_id=:id', 'module_asana_user_mappings' => 'connection_id=:id', 'module_asana_rate_limits' => 'connection_id=:id'] as $table => $where) $this->pdo->prepare('DELETE FROM ' . $table . ' WHERE ' . $where)->execute(['id' => $connectionId]);
-            $this->pdo->prepare('DELETE FROM module_asana_connections WHERE id=:id')->execute(['id' => $connectionId]);
+            $lockClause = $this->pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql' ? ' FOR UPDATE' : '';
+            $check = $this->pdo->prepare('SELECT id FROM module_asana_connections WHERE id=:id AND organization_id=:organization LIMIT 1' . $lockClause);
+            $check->execute(['id' => $connectionId, 'organization' => $organizationId]);
+            if ($check->fetchColumn() === false) throw new \RuntimeException('ASANA_CONNECTION_NOT_FOUND');
+            $activeJob = $this->pdo->prepare("SELECT id FROM module_asana_jobs WHERE connection_id=:id AND organization_id=:organization AND status IN ('queued','running','pausing','cancelling','rolling_back') LIMIT 1" . $lockClause);
+            $activeJob->execute(['id' => $connectionId, 'organization' => $organizationId]);
+            if ($activeJob->fetchColumn() !== false) throw new \RuntimeException('CONNECTION_HAS_RUNNING_JOBS');
+            foreach (['module_asana_unresolved_entities' => 'job_id IN (SELECT id FROM module_asana_jobs WHERE connection_id=:id AND organization_id=:organization)', 'module_asana_job_logs' => 'job_id IN (SELECT id FROM module_asana_jobs WHERE connection_id=:id AND organization_id=:organization)', 'module_asana_job_items' => 'job_id IN (SELECT id FROM module_asana_jobs WHERE connection_id=:id AND organization_id=:organization)', 'module_asana_jobs' => 'connection_id=:id AND organization_id=:organization', 'module_asana_source_mappings' => 'connection_id=:id', 'module_asana_user_mappings' => 'connection_id=:id', 'module_asana_rate_limits' => 'connection_id=:id'] as $table => $where) {
+                $params = ['id' => $connectionId];
+                if (str_contains($where, ':organization')) $params['organization'] = $organizationId;
+                $this->pdo->prepare('DELETE FROM ' . $table . ' WHERE ' . $where)->execute($params);
+            }
+            $this->pdo->prepare('DELETE FROM module_asana_connections WHERE id=:id AND organization_id=:organization')->execute(['id' => $connectionId, 'organization' => $organizationId]);
             $this->pdo->commit();
         } catch (\Throwable $e) { if ($this->pdo->inTransaction()) $this->pdo->rollBack(); throw $e; }
     }
@@ -114,10 +152,13 @@ final class AsanaMigrationRepository
 
     public function createJob(array $data): array
     {
+        $organizationId = (int)($data['organization_id'] ?? 0);
+        if ($organizationId < 1 || (int)($data['connection_id'] ?? 0) < 1) throw new \RuntimeException('ASANA_WORKSPACE_REQUIRED');
         $publicId = $this->id('asj'); $now = $this->now();
-        $stmt = $this->pdo->prepare('INSERT INTO module_asana_jobs (public_id,connection_id,workspace_gid,mode,status,source_scope_json,target_options_json,created_by_user_id,created_at,updated_at) VALUES (:public_id,:connection,:workspace,:mode,\'draft\',:scope,:options,:owner,:created,:updated)');
-        $stmt->execute(['public_id' => $publicId, 'connection' => $data['connection_id'], 'workspace' => $data['workspace_gid'], 'mode' => $data['mode'] ?? 'import', 'scope' => $this->json($data['source_scope'] ?? []), 'options' => $this->json($data['target_options'] ?? []), 'owner' => $data['created_by_user_id'], 'created' => $now, 'updated' => $now]);
-        return $this->getJob($publicId) ?? ['public_id' => $publicId];
+        $stmt = $this->pdo->prepare("INSERT INTO module_asana_jobs (public_id,organization_id,connection_id,workspace_gid,mode,status,source_scope_json,target_options_json,created_by_user_id,created_at,updated_at) SELECT :public_id,:organization,c.id,:workspace,:mode,'draft',:scope,:options,u.id,:created,:updated FROM module_asana_connections c JOIN users u ON u.id=:owner AND u.is_active=1 WHERE c.id=:connection AND c.organization_id=:organization_check AND (u.is_root=1 OR EXISTS (SELECT 1 FROM organization_memberships om WHERE om.user_id=u.id AND om.organization_id=c.organization_id))");
+        $stmt->execute(['public_id' => $publicId, 'organization' => $organizationId, 'workspace' => $data['workspace_gid'], 'mode' => $data['mode'] ?? 'import', 'scope' => $this->json($data['source_scope'] ?? []), 'options' => $this->json($data['target_options'] ?? []), 'owner' => $data['created_by_user_id'], 'created' => $now, 'updated' => $now, 'connection' => (int)$data['connection_id'], 'organization_check' => $organizationId]);
+        if ($stmt->rowCount() !== 1) throw new \RuntimeException('ASANA_CONNECTION_NOT_FOUND');
+        return $this->getJob($publicId, $organizationId) ?? ['public_id' => $publicId, 'organization_id' => $organizationId];
     }
 
     private function decodeJob(array $row): array
@@ -126,43 +167,54 @@ final class AsanaMigrationRepository
         return $row;
     }
 
-    public function getJob(string $publicId): ?array
+    public function getJob(string $publicId, int $organizationId): ?array
     {
-        $stmt = $this->pdo->prepare('SELECT j.*,c.name AS connection_name FROM module_asana_jobs j JOIN module_asana_connections c ON c.id=j.connection_id WHERE j.public_id=:id LIMIT 1'); $stmt->execute(['id' => $publicId]); $row = $stmt->fetch(PDO::FETCH_ASSOC); return is_array($row) ? $this->decodeJob($row) : null;
+        if ($organizationId < 1) return null;
+        $sql = 'SELECT j.*,c.name AS connection_name FROM module_asana_jobs j JOIN module_asana_connections c ON c.id=j.connection_id AND c.organization_id=j.organization_id WHERE j.public_id=:id AND j.organization_id IS NOT NULL';
+        $params = ['id' => $publicId, 'organization' => $organizationId];
+        $sql .= ' AND j.organization_id=:organization';
+        $sql .= ' LIMIT 1';
+        $stmt = $this->pdo->prepare($sql); $stmt->execute($params); $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return is_array($row) ? $this->decodeJob($row) : null;
     }
 
-    public function listJobs(int $actorId, bool $manager): array
+    public function listJobs(int $actorId, bool $manager, int $organizationId): array
     {
-        $sql = 'SELECT j.*,c.name AS connection_name FROM module_asana_jobs j JOIN module_asana_connections c ON c.id=j.connection_id'; $params = [];
-        if (!$manager) { $sql .= ' WHERE j.created_by_user_id=:owner'; $params['owner'] = $actorId; }
-        $sql .= ' ORDER BY j.created_at DESC'; $stmt = $this->pdo->prepare($sql); $stmt->execute($params); return array_map([$this, 'decodeJob'], $stmt->fetchAll(PDO::FETCH_ASSOC) ?: []);
+        if ($organizationId < 1) return [];
+        $sql = 'SELECT j.*,c.name AS connection_name FROM module_asana_jobs j JOIN module_asana_connections c ON c.id=j.connection_id AND c.organization_id=j.organization_id WHERE j.organization_id=:organization';
+        $params = ['organization' => $organizationId];
+        if (!$manager) { $sql .= ' AND j.created_by_user_id=:owner'; $params['owner'] = $actorId; }
+        $sql .= ' ORDER BY j.created_at DESC'; $stmt = $this->pdo->prepare($sql); $stmt->execute($params);
+        return array_map([$this, 'decodeJob'], $stmt->fetchAll(PDO::FETCH_ASSOC) ?: []);
     }
 
-    public function updateJobStatus(string $publicId, string $status, ?string $leaseToken = null): void
+    public function updateJobStatus(string $publicId, int $organizationId, string $status, ?string $leaseToken = null): void
     {
+        if ($organizationId < 1) throw new \RuntimeException('ASANA_WORKSPACE_REQUIRED');
         $sets = ['status=:status','updated_at=:updated']; $params = ['id' => $publicId, 'status' => $status, 'updated' => $this->now()];
+        $params['organization'] = $organizationId;
         if (in_array($status, ['queued','running'], true)) { $sets[] = 'started_at=COALESCE(started_at,:started)'; $params['started'] = $this->now(); }
         if (in_array($status, ['completed','completed_with_warnings','failed','cancelled','rolled_back','rolled_back_with_warnings','rollback_failed'], true)) { $sets[] = 'finished_at=:finished'; $params['finished'] = $this->now(); }
-        $where = ' WHERE public_id=:id';
+        $where = ' WHERE public_id=:id AND organization_id=:organization';
         if ($leaseToken !== null) { $where .= ' AND lease_token=:lease AND lease_until >= UTC_TIMESTAMP() AND status IN (\'running\',\'rolling_back\')'; $params['lease'] = $leaseToken; }
         $stmt = $this->pdo->prepare('UPDATE module_asana_jobs SET ' . implode(',', $sets) . $where); $stmt->execute($params);
-        if ($leaseToken !== null && !$this->leaseTokenMatches($publicId, $leaseToken)) throw new \RuntimeException('ASANA_JOB_LEASE_LOST');
+        if ($leaseToken !== null && !$this->leaseTokenMatches($publicId, $organizationId, $leaseToken)) throw new \RuntimeException('ASANA_JOB_LEASE_LOST');
     }
 
-    public function requestStatus(string $publicId, string $status): bool
+    public function requestStatus(string $publicId, string $expectedStatus, string $status, int $organizationId): bool
     {
-        $stmt = $this->pdo->prepare("UPDATE module_asana_jobs SET status=:status,updated_at=UTC_TIMESTAMP() WHERE public_id=:id AND status IN ('draft','queued','running','paused','pausing','cancelling','failed','cancelled','completed','completed_with_warnings')");
-        $stmt->execute(['id' => $publicId, 'status' => $status]);
+        $stmt = $this->pdo->prepare('UPDATE module_asana_jobs SET status=:status,updated_at=:updated WHERE public_id=:id AND organization_id=:organization AND status=:expected_status');
+        $stmt->execute(['id' => $publicId, 'status' => $status, 'organization' => $organizationId, 'expected_status' => $expectedStatus, 'updated' => $this->now()]);
         return $stmt->rowCount() === 1;
     }
 
     /** Atomically reserves a terminal job for rollback and gives the caller a lease. */
-    public function beginRollback(string $publicId, int $leaseSeconds = 900): ?array
+    public function beginRollback(string $publicId, int $organizationId, int $leaseSeconds = 900): ?array
     {
         $this->pdo->beginTransaction();
         try {
-            $stmt = $this->pdo->prepare('SELECT id,status,lease_until,last_source_cursor FROM module_asana_jobs WHERE public_id=:id LIMIT 1 FOR UPDATE');
-            $stmt->execute(['id' => $publicId]);
+            $stmt = $this->pdo->prepare('SELECT id,status,lease_until,last_source_cursor FROM module_asana_jobs WHERE public_id=:id AND organization_id=:organization LIMIT 1 FOR UPDATE');
+            $stmt->execute(['id' => $publicId, 'organization' => $organizationId]);
             $row = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!is_array($row)) { $this->pdo->commit(); return null; }
             $status=(string)$row['status'];
@@ -175,75 +227,82 @@ final class AsanaMigrationRepository
             if (!$terminal && !$expiredRollback) { $this->pdo->commit(); return null; }
             $token=bin2hex(random_bytes(16));$until=gmdate('Y-m-d H:i:s',time()+max(60,$leaseSeconds));
             $cursor=$expiredRollback?(string)($row['last_source_cursor']??''):json_encode(['phase'=>'rollback','before_id'=>PHP_INT_MAX],JSON_UNESCAPED_UNICODE);
-            $update=$this->pdo->prepare("UPDATE module_asana_jobs SET status='rolling_back',lease_token=:token,lease_until=:until,last_source_cursor=:cursor,updated_at=UTC_TIMESTAMP() WHERE id=:id AND status=:expected");
-            $update->execute(['token'=>$token,'until'=>$until,'cursor'=>$cursor,'id'=>(int)$row['id'],'expected'=>$status]);
+            $update=$this->pdo->prepare("UPDATE module_asana_jobs SET status='rolling_back',lease_token=:token,lease_until=:until,last_source_cursor=:cursor,updated_at=UTC_TIMESTAMP() WHERE id=:id AND organization_id=:organization AND status=:expected");
+            $update->execute(['token'=>$token,'until'=>$until,'cursor'=>$cursor,'id'=>(int)$row['id'],'organization'=>$organizationId,'expected'=>$status]);
             if ($update->rowCount() !== 1) { $this->pdo->rollBack(); return null; }
             $this->pdo->commit();
-            return $this->getJob($publicId);
+            return $this->getJob($publicId, $organizationId);
         } catch (\Throwable $e) {
             if ($this->pdo->inTransaction()) $this->pdo->rollBack();
             throw $e;
         }
     }
 
-    public function updateProgress(string $publicId, string $step, float $percent, array $progress, ?string $leaseToken = null): void
+    public function updateProgress(string $publicId, int $organizationId, string $step, float $percent, array $progress, ?string $leaseToken = null): void
     {
-        $params = ['step' => $step, 'percent' => max(0, min(100, $percent)), 'progress' => $this->json($progress), 'updated' => $this->now(), 'id' => $publicId]; $where = ' WHERE public_id=:id';
+        if ($organizationId < 1) throw new \RuntimeException('ASANA_WORKSPACE_REQUIRED');
+        $params = ['step' => $step, 'percent' => max(0, min(100, $percent)), 'progress' => $this->json($progress), 'updated' => $this->now(), 'id' => $publicId, 'organization' => $organizationId]; $where = ' WHERE public_id=:id AND organization_id=:organization';
         if ($leaseToken !== null) { $where .= ' AND lease_token=:lease AND lease_until >= UTC_TIMESTAMP() AND status IN (\'running\',\'rolling_back\')'; $params['lease'] = $leaseToken; }
         $stmt = $this->pdo->prepare('UPDATE module_asana_jobs SET current_step=:step,progress_percent=:percent,progress_json=:progress,updated_at=:updated' . $where); $stmt->execute($params);
-        if ($leaseToken !== null && !$this->ownsLease($publicId, $leaseToken)) throw new \RuntimeException('ASANA_JOB_LEASE_LOST');
+        if ($leaseToken !== null && !$this->ownsLease($publicId, $organizationId, $leaseToken)) throw new \RuntimeException('ASANA_JOB_LEASE_LOST');
     }
 
-    public function updateSummary(string $publicId, array $summary, ?string $leaseToken = null): void
+    public function updateSummary(string $publicId, int $organizationId, array $summary, ?string $leaseToken = null): void
     {
-        $params = ['summary' => $this->json($summary), 'updated' => $this->now(), 'id' => $publicId]; $where = ' WHERE public_id=:id';
+        if ($organizationId < 1) throw new \RuntimeException('ASANA_WORKSPACE_REQUIRED');
+        $params = ['summary' => $this->json($summary), 'updated' => $this->now(), 'id' => $publicId, 'organization' => $organizationId]; $where = ' WHERE public_id=:id AND organization_id=:organization';
         if ($leaseToken !== null) { $where .= ' AND lease_token=:lease AND lease_until >= UTC_TIMESTAMP() AND status IN (\'running\',\'rolling_back\')'; $params['lease'] = $leaseToken; }
         $stmt = $this->pdo->prepare('UPDATE module_asana_jobs SET summary_json=:summary,updated_at=:updated' . $where); $stmt->execute($params);
-        if ($leaseToken !== null && !$this->ownsLease($publicId, $leaseToken)) throw new \RuntimeException('ASANA_JOB_LEASE_LOST');
+        if ($leaseToken !== null && !$this->ownsLease($publicId, $organizationId, $leaseToken)) throw new \RuntimeException('ASANA_JOB_LEASE_LOST');
     }
 
     public function claimNextJob(int $leaseSeconds = 240): ?array
     {
         $this->pdo->beginTransaction();
         try {
-            $stmt = $this->pdo->query("SELECT j.id FROM module_asana_jobs j WHERE (j.status='queued' OR (j.status='running' AND j.lease_until IS NOT NULL AND j.lease_until < UTC_TIMESTAMP())) AND NOT EXISTS (SELECT 1 FROM module_asana_jobs active WHERE active.connection_id=j.connection_id AND (active.status='rolling_back' OR (active.status='running' AND active.lease_until IS NOT NULL AND active.lease_until >= UTC_TIMESTAMP()))) ORDER BY j.created_at ASC LIMIT 1 FOR UPDATE");
-            $id = $stmt->fetchColumn();
-            if ($id === false) { $this->pdo->commit(); return null; }
+            $stmt = $this->pdo->query("SELECT j.id,j.organization_id FROM module_asana_jobs j JOIN module_asana_connections c ON c.id=j.connection_id AND c.organization_id=j.organization_id WHERE j.organization_id IS NOT NULL AND (j.status='queued' OR (j.status='running' AND j.lease_until IS NOT NULL AND j.lease_until < UTC_TIMESTAMP())) AND NOT EXISTS (SELECT 1 FROM module_asana_jobs active WHERE active.connection_id=j.connection_id AND active.organization_id=j.organization_id AND (active.status='rolling_back' OR (active.status='running' AND active.lease_until IS NOT NULL AND active.lease_until >= UTC_TIMESTAMP()))) ORDER BY j.created_at ASC LIMIT 1 FOR UPDATE");
+            $candidate = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!is_array($candidate)) { $this->pdo->commit(); return null; }
+            $id = (int)$candidate['id']; $organizationId = (int)$candidate['organization_id'];
+            if ($id < 1 || $organizationId < 1) { $this->pdo->commit(); return null; }
             $token = bin2hex(random_bytes(16)); $until = gmdate('Y-m-d H:i:s', time() + $leaseSeconds);
-            $this->pdo->prepare("UPDATE module_asana_jobs SET status='running',lease_token=:token,lease_until=:until,started_at=COALESCE(started_at,UTC_TIMESTAMP()),updated_at=UTC_TIMESTAMP() WHERE id=:id")->execute(['token' => $token, 'until' => $until, 'id' => $id]);
+            $this->pdo->prepare("UPDATE module_asana_jobs SET status='running',lease_token=:token,lease_until=:until,started_at=COALESCE(started_at,UTC_TIMESTAMP()),updated_at=UTC_TIMESTAMP() WHERE id=:id AND organization_id=:organization")->execute(['token' => $token, 'until' => $until, 'id' => $id, 'organization' => $organizationId]);
             $this->pdo->commit();
-            $stmt = $this->pdo->prepare('SELECT j.*,c.name AS connection_name FROM module_asana_jobs j JOIN module_asana_connections c ON c.id=j.connection_id WHERE j.id=:id'); $stmt->execute(['id' => $id]); $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            $stmt = $this->pdo->prepare('SELECT j.*,c.name AS connection_name FROM module_asana_jobs j JOIN module_asana_connections c ON c.id=j.connection_id AND c.organization_id=j.organization_id WHERE j.id=:id AND j.organization_id=:organization'); $stmt->execute(['id' => $id, 'organization' => $organizationId]); $row = $stmt->fetch(PDO::FETCH_ASSOC);
             return is_array($row) ? $this->decodeJob($row) : null;
         } catch (\Throwable $e) { if ($this->pdo->inTransaction()) $this->pdo->rollBack(); throw $e; }
     }
 
-    public function heartbeat(string $publicId, string $leaseToken, int $leaseSeconds = 240): bool
+    public function heartbeat(string $publicId, int $organizationId, string $leaseToken, int $leaseSeconds = 240): bool
     {
-        $stmt = $this->pdo->prepare("UPDATE module_asana_jobs SET lease_until=:until,updated_at=UTC_TIMESTAMP() WHERE public_id=:id AND lease_token=:token AND lease_until >= UTC_TIMESTAMP() AND status IN ('running','rolling_back')"); $stmt->execute(['until' => gmdate('Y-m-d H:i:s', time() + $leaseSeconds), 'id' => $publicId, 'token' => $leaseToken]); return $this->ownsLease($publicId, $leaseToken);
+        if ($organizationId < 1) return false;
+        $stmt = $this->pdo->prepare("UPDATE module_asana_jobs SET lease_until=:until,updated_at=UTC_TIMESTAMP() WHERE public_id=:id AND organization_id=:organization AND lease_token=:token AND lease_until >= UTC_TIMESTAMP() AND status IN ('running','rolling_back')"); $stmt->execute(['until' => gmdate('Y-m-d H:i:s', time() + $leaseSeconds), 'id' => $publicId, 'organization' => $organizationId, 'token' => $leaseToken]); return $this->ownsLease($publicId, $organizationId, $leaseToken);
     }
 
-    public function ownsLease(string $publicId, string $leaseToken): bool
+    public function ownsLease(string $publicId, int $organizationId, string $leaseToken): bool
     {
-        $stmt = $this->pdo->prepare("SELECT id FROM module_asana_jobs WHERE public_id=:id AND lease_token=:token AND status IN ('running','rolling_back') AND lease_until >= UTC_TIMESTAMP() LIMIT 1"); $stmt->execute(['id' => $publicId, 'token' => $leaseToken]); return $stmt->fetchColumn() !== false;
+        if ($organizationId < 1) return false;
+        $stmt = $this->pdo->prepare("SELECT id FROM module_asana_jobs WHERE public_id=:id AND organization_id=:organization AND lease_token=:token AND status IN ('running','rolling_back') AND lease_until >= UTC_TIMESTAMP() LIMIT 1"); $stmt->execute(['id' => $publicId, 'organization' => $organizationId, 'token' => $leaseToken]); return $stmt->fetchColumn() !== false;
     }
 
-    private function leaseTokenMatches(string $publicId, string $leaseToken): bool
+    private function leaseTokenMatches(string $publicId, int $organizationId, string $leaseToken): bool
     {
-        $stmt = $this->pdo->prepare('SELECT id FROM module_asana_jobs WHERE public_id=:id AND lease_token=:token AND lease_until >= UTC_TIMESTAMP() LIMIT 1');
-        $stmt->execute(['id' => $publicId, 'token' => $leaseToken]);
+        if ($organizationId < 1) return false;
+        $stmt = $this->pdo->prepare('SELECT id FROM module_asana_jobs WHERE public_id=:id AND organization_id=:organization AND lease_token=:token AND lease_until >= UTC_TIMESTAMP() LIMIT 1');
+        $stmt->execute(['id' => $publicId, 'organization' => $organizationId, 'token' => $leaseToken]);
         return $stmt->fetchColumn() !== false;
     }
 
-    public function releaseLease(string $publicId, string $leaseToken): void
-    { $this->pdo->prepare('UPDATE module_asana_jobs SET lease_token=NULL,lease_until=NULL,updated_at=UTC_TIMESTAMP() WHERE public_id=:id AND lease_token=:token')->execute(['id' => $publicId, 'token' => $leaseToken]); }
+    public function releaseLease(string $publicId, int $organizationId, string $leaseToken): void
+    { if ($organizationId < 1) return; $this->pdo->prepare('UPDATE module_asana_jobs SET lease_token=NULL,lease_until=NULL,updated_at=UTC_TIMESTAMP() WHERE public_id=:id AND organization_id=:organization AND lease_token=:token')->execute(['id' => $publicId, 'organization' => $organizationId, 'token' => $leaseToken]); }
 
     /** Atomically queues failed items and resets the import checkpoint. */
-    public function retryJob(string $publicId): ?int
+    public function retryJob(string $publicId, int $organizationId): ?int
     {
         $this->pdo->beginTransaction();
         try {
-            $jobStmt=$this->pdo->prepare("SELECT id FROM module_asana_jobs WHERE public_id=:id AND status IN ('completed_with_warnings','failed','cancelled') LIMIT 1 FOR UPDATE");
-            $jobStmt->execute(['id'=>$publicId]);$job=$jobStmt->fetch(PDO::FETCH_ASSOC);
+            $jobStmt=$this->pdo->prepare("SELECT id FROM module_asana_jobs WHERE public_id=:id AND organization_id=:organization AND status IN ('completed_with_warnings','failed','cancelled') LIMIT 1 FOR UPDATE");
+            $jobStmt->execute(['id'=>$publicId,'organization'=>$organizationId]);$job=$jobStmt->fetch(PDO::FETCH_ASSOC);
             if(!is_array($job)){$this->pdo->commit();return null;}
             $items=$this->pdo->prepare("UPDATE module_asana_job_items SET status='pending',error_code=NULL,error_message=NULL,updated_at=UTC_TIMESTAMP() WHERE job_id=:job AND status='failed'");$items->execute(['job'=>(int)$job['id']]);$count=$items->rowCount();
             $this->pdo->prepare("UPDATE module_asana_jobs SET status='queued',last_source_cursor=NULL,updated_at=UTC_TIMESTAMP() WHERE id=:id")->execute(['id'=>(int)$job['id']]);
@@ -251,8 +310,8 @@ final class AsanaMigrationRepository
         } catch(\Throwable $e){if($this->pdo->inTransaction())$this->pdo->rollBack();throw $e;}
     }
 
-    public function resetFailedItems(string $publicId): int
-    { return $this->retryJob($publicId) ?? 0; }
+    public function resetFailedItems(string $publicId, int $organizationId): int
+    { return $this->retryJob($publicId, $organizationId) ?? 0; }
 
     public function upsertItem(int $jobId, string $type, string $sourceId, array $data): void
     {
@@ -291,14 +350,15 @@ final class AsanaMigrationRepository
         return $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
     }
 
-    public function updateCursor(string $publicId, string $cursor, ?string $leaseToken = null): void
+    public function updateCursor(string $publicId, int $organizationId, string $cursor, ?string $leaseToken = null): void
     {
-        $params = ['id' => $publicId, 'cursor' => $cursor];
-        $where = ' WHERE public_id=:id';
+        if ($organizationId < 1) throw new \RuntimeException('ASANA_WORKSPACE_REQUIRED');
+        $params = ['id' => $publicId, 'organization' => $organizationId, 'cursor' => $cursor];
+        $where = ' WHERE public_id=:id AND organization_id=:organization';
         if ($leaseToken !== null) { $where .= ' AND lease_token=:lease AND lease_until >= UTC_TIMESTAMP() AND status IN (\'running\',\'rolling_back\')'; $params['lease'] = $leaseToken; }
         $stmt = $this->pdo->prepare('UPDATE module_asana_jobs SET last_source_cursor=:cursor,updated_at=UTC_TIMESTAMP()' . $where);
         $stmt->execute($params);
-        if ($leaseToken !== null && !$this->ownsLease($publicId, $leaseToken)) throw new \RuntimeException('ASANA_JOB_LEASE_LOST');
+        if ($leaseToken !== null && !$this->ownsLease($publicId, $organizationId, $leaseToken)) throw new \RuntimeException('ASANA_JOB_LEASE_LOST');
     }
 
     public function itemCounts(int $jobId): array
@@ -323,17 +383,26 @@ final class AsanaMigrationRepository
     { $stmt=$this->pdo->prepare('SELECT * FROM module_asana_user_mappings WHERE connection_id=:id ORDER BY display_name ASC'); $stmt->execute(['id'=>$connectionId]); return $stmt->fetchAll(PDO::FETCH_ASSOC)?:[]; }
     public function updateUserMapping(int $connectionId,int $mappingId,?string $crmPublicId): bool
     { $status=$crmPublicId?'mapped':'unmapped'; $stmt=$this->pdo->prepare('UPDATE module_asana_user_mappings SET crm_user_public_id=:crm,mapping_status=:status,updated_at=UTC_TIMESTAMP() WHERE id=:id AND connection_id=:connection'); $stmt->execute(['crm'=>$crmPublicId?:null,'status'=>$status,'id'=>$mappingId,'connection'=>$connectionId]); return $stmt->rowCount()===1; }
-    public function activeUserPublicId(string $publicId): ?string
-    { $stmt=$this->pdo->prepare('SELECT public_id FROM users WHERE public_id=:id AND is_active=1 LIMIT 1'); $stmt->execute(['id'=>$publicId]); $value=$stmt->fetchColumn(); return $value===false?null:(string)$value; }
-    public function mappedUserId(int $connectionId,string $asanaGid): ?int
-    { $stmt=$this->pdo->prepare('SELECT u.id FROM module_asana_user_mappings m JOIN users u ON u.public_id=m.crm_user_public_id WHERE m.connection_id=:connection AND m.asana_user_gid=:gid AND m.mapping_status=\'mapped\' AND u.is_active=1 LIMIT 1'); $stmt->execute(['connection'=>$connectionId,'gid'=>$asanaGid]); $value=$stmt->fetchColumn(); return $value===false?null:(int)$value; }
+    public function activeUserPublicId(string $publicId, int $organizationId): ?string
+    {
+        if ($organizationId < 1) return null;
+        $stmt = $this->pdo->prepare('SELECT u.public_id FROM users u WHERE u.public_id=:id AND u.is_active=1 AND (u.is_root=1 OR EXISTS (SELECT 1 FROM organization_memberships om WHERE om.user_id=u.id AND om.organization_id=:organization)) LIMIT 1');
+        $stmt->execute(['id' => $publicId, 'organization' => $organizationId]);
+        $value = $stmt->fetchColumn(); return $value === false ? null : (string)$value;
+    }
+    public function mappedUserId(int $connectionId, string $asanaGid): ?int
+    {
+        $stmt = $this->pdo->prepare('SELECT u.id FROM module_asana_user_mappings m JOIN module_asana_connections c ON c.id=m.connection_id JOIN users u ON u.public_id=m.crm_user_public_id WHERE m.connection_id=:connection AND m.asana_user_gid=:gid AND m.mapping_status=\'mapped\' AND u.is_active=1 AND (u.is_root=1 OR EXISTS (SELECT 1 FROM organization_memberships om WHERE om.organization_id=c.organization_id AND om.user_id=u.id)) LIMIT 1');
+        $stmt->execute(['connection' => $connectionId, 'gid' => $asanaGid]);
+        $value = $stmt->fetchColumn(); return $value === false ? null : (int)$value;
+    }
 
     public function addLog(int $jobId,string $level,string $step,string $message,array $context=[]): void
     { $stmt=$this->pdo->prepare('INSERT INTO module_asana_job_logs (job_id,level,step,message,context_json,created_at) VALUES (:job,:level,:step,:message,:context,:created)'); $stmt->execute(['job'=>$jobId,'level'=>$level,'step'=>$step,'message'=>mb_substr($message,0,2000),'context'=>$context===[]?null:$this->json($context),'created'=>$this->now()]); }
     public function logs(int $jobId,int $limit=100): array
     { $stmt=$this->pdo->prepare('SELECT * FROM module_asana_job_logs WHERE job_id=:job ORDER BY id DESC LIMIT '.max(1,min(1000,$limit))); $stmt->execute(['job'=>$jobId]); return $stmt->fetchAll(PDO::FETCH_ASSOC)?:[]; }
-    public function report(string $publicId): array
-    { $job=$this->getJob($publicId); if(!$job)return[]; $job['items']=$this->itemCounts((int)$job['id']); $job['logs']=$this->logs((int)$job['id']); return $job; }
+    public function report(string $publicId, int $organizationId): array
+    { $job=$this->getJob($publicId, $organizationId); if(!$job)return[]; $job['items']=$this->itemCounts((int)$job['id']); $job['logs']=$this->logs((int)$job['id']); return $job; }
     public function unresolved(int $jobId,string $type,string $sourceId,string $code,string $text,array $payload=[]): void
     { $stmt=$this->pdo->prepare('INSERT INTO module_asana_unresolved_entities (job_id,source_type,source_id,reason_code,reason_text,payload_json,created_at) VALUES (:job,:type,:source,:code,:text,:payload,:created)'); $stmt->execute(['job'=>$jobId,'type'=>$type,'source'=>$sourceId,'code'=>$code,'text'=>$text,'payload'=>$payload===[]?null:$this->json($payload),'created'=>$this->now()]); }
 }

@@ -54,13 +54,13 @@ final class AsanaTargetWriter
     }
 
     /** @return array{target_type:string,target_public_id:string,state:string,warnings:array<int,string>} */
-    public function tag(array $job, array $payload): array
+    public function tag(array $job, array $payload, array $actor): array
     {
         $source=(string)($payload['gid']??''); $workspace=(string)$job['workspace_gid']; $mapping=$this->repo->findMapping((int)$job['connection_id'],$workspace,'tag',$source);
         if($mapping && !empty($mapping['target_public_id'])) return ['target_type'=>'tag','target_public_id'=>(string)$mapping['target_public_id'],'state'=>'skipped','warnings'=>[]];
         $code='asana_'.substr(hash('sha256',$workspace.':'.$source),0,24);
-        $created=$this->service('service.tag')->create(['code'=>$code,'title'=>trim((string)($payload['name']??'Asana tag')),'color'=>$this->color((string)($payload['color']??'')),'description'=>'Imported from Asana tag '.$source]);
-        if($created==='TAG_CODE_EXISTS'){ $list=$this->service('service.tag')->list(['search'=>$code,'limit'=>5]); $created=$list['items'][0]??null; }
+        $created=$this->service('service.tag')->create(['code'=>$code,'title'=>trim((string)($payload['name']??'Asana tag')),'color'=>$this->color((string)($payload['color']??'')),'description'=>'Imported from Asana tag '.$source], $actor);
+        if($created==='TAG_CODE_EXISTS'){ $list=$this->service('service.tag')->list(['search'=>$code,'limit'=>5], $actor); $created=$list['items'][0]??null; }
         if(!is_array($created)||empty($created['public_id'])) throw new RuntimeException('ASANA_TAG_CREATE_FAILED');
         return ['target_type'=>'tag','target_public_id'=>(string)$created['public_id'],'state'=>'imported','warnings'=>[]];
     }

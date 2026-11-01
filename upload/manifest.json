@@ -1,6 +1,6 @@
 {
     "name": "crm.asana-migration",
-    "version": "1.0.0",
+    "version": "1.0.2",
     "vendor": "crm",
     "author": "Anton Barinov",
     "author_url": "https://github.com/Anton-Barinov",
@@ -18,10 +18,14 @@
     "web_routes": "web/config/routes.php",
     "migrations": "api/migration/",
     "assets": {
-        "js_routes": {"module-asana-migration": "web/assets/js/asana-migration.js"},
-        "css": ["web/assets/css/asana-migration.css"]
+        "js_routes": {
+            "module-asana-migration": "web/assets/js/asana-migration.js"
+        },
+        "css": [
+            "web/assets/css/asana-migration.css"
+        ]
     },
-    "hooks": {},
+    "hooks": [],
     "menu_items": [],
     "service_provider": "Module\\Crm\\AsanaMigration\\AsanaMigrationServiceProvider",
     "config_defaults": {
@@ -34,5 +38,6 @@
         "default_section_mode": "project_module",
         "max_tasks_per_job": 0,
         "webhooks_enabled_by_default": false
-    }
+    },
+    "signature": "8b1c9a8f52895e96ef3bc24ffedd5eeb86ef2820432872bc1ca92b34983e80cd"
 }

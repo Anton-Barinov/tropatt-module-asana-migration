@@ -8,20 +8,31 @@ use RuntimeException;
 
 final class AsanaImportService
 {
+    public const MAX_ATTACHMENT_SIZE_MB = 20;
+
     public function __construct(private readonly AsanaMigrationRepository $repo, private readonly AsanaClient $client, private readonly AsanaCrawler $crawler, private readonly AsanaTargetWriter $writer)
     {
     }
 
-    public function processJob(string $jobPublicId, ?string $leaseToken = null): void
+    public function processJob(string $jobPublicId, int $organizationId, ?string $leaseToken = null): void
     {
-        $job = $this->repo->getJob($jobPublicId);
+        if ($organizationId < 1) throw new RuntimeException('ASANA_WORKSPACE_REQUIRED');
+        if ($leaseToken === null || $leaseToken === '') throw new RuntimeException('ASANA_JOB_LEASE_REQUIRED');
+        $job = $this->repo->getJob($jobPublicId, $organizationId);
         if (!$job) return;
-        $connection = $this->repo->getConnectionById((int)$job['connection_id']);
+        // Resolve the original owner against the persisted CRM workspace on every worker run.
+        // A queued job must not become a way to retain access after membership is revoked.
+        $actor = $this->actor($job, $organizationId);
+        $connection = $this->repo->getConnectionById((int)$job['connection_id'], $organizationId);
         if (!$connection) throw new RuntimeException('ASANA_CONNECTION_NOT_FOUND');
         $token = EncryptionService::decrypt((string)($connection['access_token_encrypted'] ?? ''));
         if ($token === null) throw new RuntimeException('ASANA_CREDENTIAL_DECRYPT_FAILED');
         $this->client->setConnectionId((int)$connection['id']);
-        $heartbeat = $leaseToken !== null ? fn(): bool => $this->repo->heartbeat($jobPublicId, $leaseToken) : null;
+        $heartbeat = function () use ($job, $organizationId, $jobPublicId, $leaseToken): bool {
+            // The crawler can take many minutes; check membership between source pages/items too.
+            $this->actor($job, $organizationId);
+            return $leaseToken === null || $this->repo->heartbeat($jobPublicId, $organizationId, $leaseToken);
+        };
         $existingCursor = json_decode((string)($job['last_source_cursor'] ?? ''), true);
         $resumeImport = ($job['mode'] ?? 'import') !== 'dry_run'
             && is_array($existingCursor)
@@ -32,21 +43,23 @@ final class AsanaImportService
         if ($resumeImport) {
             $crawl = ['resumed' => true, 'warnings' => []];
         } else {
-            $this->repo->updateProgress($jobPublicId, 'crawl', 0, ['message' => 'Loading Asana source graph'], $leaseToken);
+            $this->repo->updateProgress($jobPublicId, $organizationId, 'crawl', 0, ['message' => 'Loading Asana source graph'], $leaseToken);
             $crawl = $this->crawler->crawl($job, $token, $heartbeat);
-            if ($leaseToken !== null && !$this->repo->heartbeat($jobPublicId, $leaseToken)) throw new RuntimeException('ASANA_JOB_LEASE_LOST');
+            if ($leaseToken !== null && !$this->repo->heartbeat($jobPublicId, $organizationId, $leaseToken)) throw new RuntimeException('ASANA_JOB_LEASE_LOST');
             $this->repo->addLog((int)$job['id'], 'info', 'crawl', 'Asana source graph loaded.', $crawl);
-            if (($job['mode'] ?? 'import') !== 'dry_run') $this->repo->updateCursor($jobPublicId, json_encode(['phase' => 'import', 'priority' => 0, 'id' => 0], JSON_UNESCAPED_UNICODE), $leaseToken);
+            if (($job['mode'] ?? 'import') !== 'dry_run') $this->repo->updateCursor($jobPublicId, $organizationId, json_encode(['phase' => 'import', 'priority' => 0, 'id' => 0], JSON_UNESCAPED_UNICODE), $leaseToken);
         }
 
+        // A dry run still reads and persists source records; do not finish it after access is revoked.
+        $this->actor($job, $organizationId);
+
         if (($job['mode'] ?? 'import') === 'dry_run') {
-            $this->repo->updateSummary($jobPublicId, ['crawled' => $crawl, 'items' => $this->repo->itemCounts((int)$job['id'])], $leaseToken);
-            $this->repo->updateProgress($jobPublicId, 'dry_run_complete', 100, $crawl, $leaseToken);
-            $this->repo->updateJobStatus($jobPublicId, 'completed_with_warnings', $leaseToken);
+            $this->repo->updateSummary($jobPublicId, $organizationId, ['crawled' => $crawl, 'items' => $this->repo->itemCounts((int)$job['id'])], $leaseToken);
+            $this->repo->updateProgress($jobPublicId, $organizationId, 'dry_run_complete', 100, $crawl, $leaseToken);
+            $this->repo->updateJobStatus($jobPublicId, $organizationId, 'completed_with_warnings', $leaseToken);
             return;
         }
 
-        $actor = $this->actor($job);
         $total = max(1, $this->repo->itemCount((int)$job['id']));
         $counts = $this->repo->itemCounts((int)$job['id']);
         $done = (int)($counts['imported'] ?? 0) + (int)($counts['updated'] ?? 0) + (int)($counts['skipped'] ?? 0) + (int)($counts['failed'] ?? 0);
@@ -57,12 +70,15 @@ final class AsanaImportService
 
         while (($items = $this->repo->importItemsBatch((int)$job['id'], $priority, $lastId, 250)) !== []) {
             foreach ($items as $item) {
-                if ($leaseToken !== null && !$this->repo->heartbeat($jobPublicId, $leaseToken)) throw new RuntimeException('ASANA_JOB_LEASE_LOST');
-                $current = $this->repo->getJob($jobPublicId);
+                if ($leaseToken !== null && !$this->repo->heartbeat($jobPublicId, $organizationId, $leaseToken)) throw new RuntimeException('ASANA_JOB_LEASE_LOST');
+                $current = $this->repo->getJob($jobPublicId, $organizationId);
+                // Revalidate before every target write so membership removal during a long
+                // import stops further writes. Core services receive the persisted org context.
+                $actor = $this->actor($job, $organizationId);
                 $currentStatus = (string)($current['status'] ?? '');
                 if (in_array($currentStatus, ['pausing', 'paused', 'cancelling', 'cancelled'], true)) {
-                    if ($currentStatus === 'pausing') $this->repo->updateJobStatus($jobPublicId, 'paused');
-                    if ($currentStatus === 'cancelling') $this->repo->updateJobStatus($jobPublicId, 'cancelled');
+                    if ($currentStatus === 'pausing') $this->repo->updateJobStatus($jobPublicId, $organizationId, 'paused', $leaseToken);
+                    if ($currentStatus === 'cancelling') $this->repo->updateJobStatus($jobPublicId, $organizationId, 'cancelled', $leaseToken);
                     return;
                 }
                 $type = (string)$item['source_type'];
@@ -81,11 +97,11 @@ final class AsanaImportService
                     $result = match ($type) {
                         'project' => $this->writer->project($job, $payload, $actor),
                         'section' => $this->writer->section($job, $payload, $actor),
-                        'tag' => $this->writer->tag($job, $payload),
+                        'tag' => $this->writer->tag($job, $payload, $actor),
                         'task', 'subtask' => $this->writer->task($job, $payload, $actor),
                         'dependency' => $this->writer->dependency($job, $payload, $actor),
                         'comment' => $this->writer->comment($job, $payload, $actor),
-                        'attachment' => $this->writer->attachment($job, $payload, $actor, $token, max(1, (int)($job['target_options']['max_attachment_size_mb'] ?? 20)) * 1024 * 1024),
+                        'attachment' => $this->writer->attachment($job, $payload, $actor, $token, $this->attachmentMaxBytes($job)),
                         default => ['target_type' => '', 'target_public_id' => '', 'state' => 'skipped', 'warnings' => []],
                     };
                     $warnings = array_merge($warnings, (array)($result['warnings'] ?? []));
@@ -99,23 +115,32 @@ final class AsanaImportService
                 $done++;
                 $priority = (int)($item['import_priority'] ?? $priority);
                 $lastId = (int)$item['id'];
-                $this->repo->updateProgress($jobPublicId, 'import_' . $type, min(99, ($done / $total) * 100), ['processed' => $done, 'total' => $total, 'warnings' => count($warnings)], $leaseToken);
+            $this->repo->updateProgress($jobPublicId, $organizationId, 'import_' . $type, min(99, ($done / $total) * 100), ['processed' => $done, 'total' => $total, 'warnings' => count($warnings)], $leaseToken);
             }
             // The cursor is persisted only after a complete batch. A worker crash therefore retries the whole unfinished batch.
-            $this->repo->updateCursor($jobPublicId, json_encode(['phase' => 'import', 'priority' => $priority, 'id' => $lastId], JSON_UNESCAPED_UNICODE), $leaseToken);
+            $this->repo->updateCursor($jobPublicId, $organizationId, json_encode(['phase' => 'import', 'priority' => $priority, 'id' => $lastId], JSON_UNESCAPED_UNICODE), $leaseToken);
         }
 
         $summary = ['crawled' => $crawl, 'items' => $this->repo->itemCounts((int)$job['id']), 'warnings' => array_values(array_unique($warnings))];
-        $this->repo->updateSummary($jobPublicId, $summary, $leaseToken);
-        $this->repo->updateProgress($jobPublicId, 'completed', 100, $summary, $leaseToken);
+        $this->repo->updateSummary($jobPublicId, $organizationId, $summary, $leaseToken);
+        $this->repo->updateProgress($jobPublicId, $organizationId, 'completed', 100, $summary, $leaseToken);
         $failed = (int)($summary['items']['failed'] ?? 0);
-        $this->repo->updateJobStatus($jobPublicId, $failed > 0 || $summary['warnings'] !== [] ? 'completed_with_warnings' : 'completed', $leaseToken);
+        $this->repo->updateJobStatus($jobPublicId, $organizationId, $failed > 0 || $summary['warnings'] !== [] ? 'completed_with_warnings' : 'completed', $leaseToken);
         $this->repo->addLog((int)$job['id'], 'info', 'completed', 'Asana migration completed.', ['failed' => $failed, 'warnings' => count($summary['warnings'])]);
+    }
+
+    private function attachmentMaxBytes(array $job): int
+    {
+        $configuredMb = (int)($job['target_options']['max_attachment_size_mb'] ?? self::MAX_ATTACHMENT_SIZE_MB);
+        return min(self::MAX_ATTACHMENT_SIZE_MB, max(1, $configuredMb)) * 1024 * 1024;
     }
 
     public function rollback(string $jobPublicId, array $actor): void
     {
-        $job = $this->repo->beginRollback($jobPublicId);
+        $organizationId = (int)($actor['organization_id'] ?? 0);
+        $actor = $this->actor(['created_by_user_id' => (int)($actor['id'] ?? 0)], $organizationId);
+        if ($organizationId < 1) throw new RuntimeException('ASANA_WORKSPACE_REQUIRED');
+        $job = $this->repo->beginRollback($jobPublicId, $organizationId);
         if (!$job) throw new RuntimeException('ASANA_ROLLBACK_REQUIRES_TERMINAL_JOB');
         $leaseToken = (string)($job['lease_token'] ?? '');
         $warnings = [];
@@ -125,14 +150,14 @@ final class AsanaImportService
             while (($items = $this->repo->rollbackItemsBatch((int)$job['id'], $beforeId, 250)) !== []) {
                 $batchHadWarning = false;
                 foreach ($items as $item) {
-                    if (!$this->repo->heartbeat($jobPublicId, $leaseToken)) throw new RuntimeException('ASANA_ROLLBACK_LEASE_LOST');
+                    if (!$this->repo->heartbeat($jobPublicId, $organizationId, $leaseToken)) throw new RuntimeException('ASANA_ROLLBACK_LEASE_LOST');
                     if ((int)($item['created_by_job'] ?? 0) !== 1 || empty($item['target_public_id'])) continue;
                     try {
                         $targetType = (string)$item['target_type'];
                         $serviceId = match ($targetType) { 'project' => 'service.project', 'task' => 'service.task', 'file' => 'service.file', 'project_module' => 'service.project_module', 'tag' => 'service.tag', 'dependency' => 'service.dependency', 'comment' => 'service.comment', default => '' };
                         if ($serviceId === '') continue;
                         $service = $this->containerService($serviceId);
-                        $deleted = $targetType === 'tag' ? $service->delete((string)$item['target_public_id']) : $service->delete((string)$item['target_public_id'], $actor);
+                        $deleted = $service->delete((string)$item['target_public_id'], $actor);
                         if ($deleted !== true) throw new RuntimeException('ASANA_ROLLBACK_TARGET_NOT_DELETED');
                         $this->repo->upsertItem((int)$job['id'], (string)$item['source_type'], (string)$item['source_id'], ['status' => 'rolled_back']);
                     } catch (\Throwable $e) {
@@ -147,17 +172,17 @@ final class AsanaImportService
                 // can be retried from the beginning, while a worker crash before that state retries this batch.
                 if ($batchHadWarning) break;
                 $beforeId = min(array_map('intval', array_column($items, 'id')));
-                $this->repo->updateCursor($jobPublicId, json_encode(['phase' => 'rollback', 'before_id' => $beforeId], JSON_UNESCAPED_UNICODE), $leaseToken);
+                $this->repo->updateCursor($jobPublicId, $organizationId, json_encode(['phase' => 'rollback', 'before_id' => $beforeId], JSON_UNESCAPED_UNICODE), $leaseToken);
             }
-            $this->repo->updateSummary($jobPublicId, ['rollback_warnings' => array_values(array_unique($warnings))], $leaseToken);
-            $this->repo->updateProgress($jobPublicId, 'rolled_back', 100, ['warnings' => count($warnings)], $leaseToken);
-            $this->repo->updateJobStatus($jobPublicId, $warnings === [] ? 'rolled_back' : 'rolled_back_with_warnings', $leaseToken);
-            $this->repo->releaseLease($jobPublicId, $leaseToken);
+            $this->repo->updateSummary($jobPublicId, $organizationId, ['rollback_warnings' => array_values(array_unique($warnings))], $leaseToken);
+            $this->repo->updateProgress($jobPublicId, $organizationId, 'rolled_back', 100, ['warnings' => count($warnings)], $leaseToken);
+            $this->repo->updateJobStatus($jobPublicId, $organizationId, $warnings === [] ? 'rolled_back' : 'rolled_back_with_warnings', $leaseToken);
+            $this->repo->releaseLease($jobPublicId, $organizationId, $leaseToken);
         } catch (\Throwable $e) {
             try {
-                if ($this->repo->ownsLease($jobPublicId, $leaseToken)) {
-                    $this->repo->updateJobStatus($jobPublicId, 'rollback_failed', $leaseToken);
-                    $this->repo->releaseLease($jobPublicId, $leaseToken);
+                if ($this->repo->ownsLease($jobPublicId, $organizationId, $leaseToken)) {
+                    $this->repo->updateJobStatus($jobPublicId, $organizationId, 'rollback_failed', $leaseToken);
+                    $this->repo->releaseLease($jobPublicId, $organizationId, $leaseToken);
                 }
             } catch (\Throwable) {
             }
@@ -166,5 +191,10 @@ final class AsanaImportService
     }
 
     private function containerService(string $id): mixed { return $this->writer->service($id); }
-    private function actor(array $job): array { return $this->repo->actor((int)$job['created_by_user_id']); }
+    private function actor(array $job, int $organizationId): array
+    {
+        $actor = $this->repo->actor((int)($job['created_by_user_id'] ?? 0), $organizationId);
+        if ($actor === null) throw new RuntimeException('ASANA_WORKSPACE_MEMBERSHIP_REVOKED');
+        return $actor;
+    }
 }

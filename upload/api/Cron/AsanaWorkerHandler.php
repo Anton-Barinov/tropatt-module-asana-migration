@@ -24,14 +24,16 @@ final class AsanaWorkerHandler
         $writer = new AsanaTargetWriter($container, $repo, $client);
         $service = new AsanaImportService($repo, $client, $crawler, $writer);
         try {
-            $service->processJob((string)$job['public_id'], $token);
-            $repo->releaseLease((string)$job['public_id'], $token);
+            $organizationId = (int)$job['organization_id'];
+            $service->processJob((string)$job['public_id'], $organizationId, $token);
+            $repo->releaseLease((string)$job['public_id'], $organizationId, $token);
             return json_encode(['processed' => 1, 'job' => $job['public_id']], JSON_UNESCAPED_UNICODE) ?: '{}';
         } catch (\Throwable $e) {
             $repo->addLog((int)$job['id'], 'error', 'worker', 'Asana worker failed.');
-            if ($token === '' || $repo->ownsLease((string)$job['public_id'], $token)) {
-                try { $repo->updateJobStatus((string)$job['public_id'], 'failed', $token !== '' ? $token : null); } catch (\Throwable) { }
-                $repo->releaseLease((string)$job['public_id'], $token);
+            $organizationId = (int)($job['organization_id'] ?? 0);
+            if ($token === '' || $repo->ownsLease((string)$job['public_id'], $organizationId, $token)) {
+                try { $repo->updateJobStatus((string)$job['public_id'], $organizationId, 'failed', $token !== '' ? $token : null); } catch (\Throwable) { }
+                $repo->releaseLease((string)$job['public_id'], $organizationId, $token);
             }
             return json_encode(['processed' => 1, 'failed' => 1], JSON_UNESCAPED_UNICODE) ?: '{}';
         }

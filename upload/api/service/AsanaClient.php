@@ -145,10 +145,11 @@ final class AsanaClient
     /** Download an attachment while validating every redirect destination. */
     private function downloadAttachmentUrl(string $token, string $url, int $maxBytes, int $redirects): array
     {
-        $parts = parse_url($url);
-        $host = strtolower((string)($parts['host'] ?? ''));
-        if (($parts['scheme'] ?? '') !== 'https' || $host === '' || !$this->allowedAttachmentHost($host) || (!$this->allowedHost($host) && !$this->hasSignedStorageQuery((string)($parts['query'] ?? ''))) || $this->privateHost($host)) throw new RuntimeException('ASANA_SSRF_BLOCKED');
+        [$parts, $host] = $this->validateAttachmentUrl($url);
         if ($redirects > 3) throw new RuntimeException('ASANA_ATTACHMENT_REDIRECT_LIMIT');
+        // Resolve and pin a validated public address for this individual request.
+        // This prevents a DNS change between validation and cURL connection.
+        $pinnedIp = $this->resolvePublicAddress($host);
         $tmp = tempnam(sys_get_temp_dir(), 'asana-');
         if ($tmp === false) throw new RuntimeException('ASANA_ATTACHMENT_TEMP_FAILED');
         $fp = fopen($tmp, 'wb');
@@ -160,7 +161,11 @@ final class AsanaClient
         curl_setopt_array($ch, [
             CURLOPT_WRITEFUNCTION => static function ($curl, string $chunk) use ($fp, &$written, &$overflow, $maxBytes): int { $length = strlen($chunk); if ($written + $length > $maxBytes) { $overflow = true; return 0; } $written += $length; return fwrite($fp, $chunk) ?: 0; },
             CURLOPT_TIMEOUT => max(10, $this->timeout * 2), CURLOPT_CONNECTTIMEOUT => 10, CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_SSL_VERIFYPEER => true, CURLOPT_HTTPHEADER => $requestHeaders,
+            CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_PROXY => '',
+            CURLOPT_RESOLVE => [$this->curlResolveEntry($host, $pinnedIp)],
+            CURLOPT_HTTPHEADER => $requestHeaders,
             CURLOPT_HEADERFUNCTION => static function ($curl, string $line) use (&$headers): int { $length = strlen($line); if (str_contains($line, ':')) { [$name, $value] = array_pad(explode(':', $line, 2), 2, ''); $headers[strtolower(trim($name))] = trim($value); } return $length; },
         ]);
         $ok = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE); curl_close($ch); fclose($fp);
@@ -278,6 +283,60 @@ final class AsanaClient
         throw new RuntimeException('ASANA_REQUEST_FAILED');
     }
 
+
+    /** @return array{0:array<string,mixed>,1:string} */
+    private function validateAttachmentUrl(string $url): array
+    {
+        $parts = parse_url($url);
+        if (!is_array($parts)) throw new RuntimeException('ASANA_SSRF_BLOCKED');
+        $host = strtolower((string)($parts['host'] ?? ''));
+        $port = (int)($parts['port'] ?? 443);
+        if (($parts['scheme'] ?? '') !== 'https'
+            || $host === ''
+            || $port !== 443
+            || isset($parts['user'])
+            || isset($parts['pass'])
+            || isset($parts['fragment'])
+            || !$this->allowedAttachmentHost($host)
+            || (!$this->allowedHost($host) && !$this->hasSignedStorageQuery((string)($parts['query'] ?? '')))) {
+            throw new RuntimeException('ASANA_SSRF_BLOCKED');
+        }
+        return [$parts, $host];
+    }
+
+    private function resolvePublicAddress(string $host): string
+    {
+        $addresses = [];
+        if (function_exists('dns_get_record')) {
+            foreach ((array)@dns_get_record($host, DNS_A | DNS_AAAA) as $record) {
+                $ip = (string)($record['ip'] ?? $record['ipv6'] ?? '');
+                if ($ip !== '') $addresses[] = $ip;
+            }
+        }
+        if ($addresses === []) $addresses = gethostbynamel($host) ?: [];
+        return $this->selectPublicAddress($addresses);
+    }
+
+    /** @param array<int,string> $addresses */
+    private function selectPublicAddress(array $addresses): string
+    {
+        $addresses = array_values(array_unique(array_filter($addresses, static fn(string $ip): bool => $ip !== '')));
+        if ($addresses === []) throw new RuntimeException('ASANA_SSRF_BLOCKED');
+        foreach ($addresses as $ip) {
+            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+                throw new RuntimeException('ASANA_SSRF_BLOCKED');
+            }
+        }
+        return $addresses[0];
+    }
+
+    private function curlResolveEntry(string $host, string $ip): string
+    {
+        if (filter_var($ip, FILTER_VALIDATE_IP) === false) throw new RuntimeException('ASANA_SSRF_BLOCKED');
+        $address = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) !== false ? '[' . $ip . ']' : $ip;
+        return $host . ':443:' . $address;
+    }
+
     private function waitRateLimit(int $connectionId): void
     {
         $state = $this->repo->rateState($connectionId);
@@ -320,19 +379,4 @@ final class AsanaClient
         return strlen($signature) >= 16;
     }
 
-    private function privateHost(string $host): bool
-    {
-        if ($host === 'localhost' || str_ends_with($host, '.local')) return true;
-        $ips = filter_var($host, FILTER_VALIDATE_IP) !== false ? [$host] : [];
-        if ($ips === [] && function_exists('dns_get_record')) {
-            foreach ((array)@dns_get_record($host, DNS_A | DNS_AAAA) as $record) {
-                $ip = (string)($record['ip'] ?? $record['ipv6'] ?? '');
-                if ($ip !== '') $ips[] = $ip;
-            }
-        }
-        if ($ips === []) $ips = gethostbynamel($host) ?: [];
-        if ($ips === []) return true;
-        foreach ($ips as $ip) if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) return true;
-        return false;
-    }
 }
